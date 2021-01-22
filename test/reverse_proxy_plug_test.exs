@@ -137,6 +137,36 @@ defmodule ReverseProxyPlugTest do
     assert ReverseProxyPlug.read_body(conn) == "not raw body"
   end
 
+  test "missing upstream opt results in KeyError" do
+    bad_opts = Keyword.delete(@opts, :upstream)
+
+    assert_raise KeyError, fn ->
+      ReverseProxyPlug.init(bad_opts)
+    end
+  end
+
+  test "calls status callback" do
+    ReverseProxyPlug.HTTPClientMock
+    |> expect(:request, TestReuse.get_stream_responder(%{status_code: 500}))
+
+    opts =
+      @opts
+      |> Keyword.merge(
+        status_callbacks: %{
+          500 => fn conn, _opts ->
+            conn |> Plug.Conn.resp(404, "not found")
+          end
+        }
+      )
+
+    conn =
+      conn(:get, "/")
+      |> ReverseProxyPlug.call(ReverseProxyPlug.init(opts))
+
+    assert conn.status == 404
+    assert conn.resp_body == "not found"
+  end
+
   test_stream_and_buffer "removes hop-by-hop headers before forwarding request" do
     %{opts: opts, get_responder: get_responder} = test_reuse_opts
 
@@ -202,7 +232,32 @@ defmodule ReverseProxyPlugTest do
 
     conn(:get, "/") |> ReverseProxyPlug.call(ReverseProxyPlug.init(opts_with_callback))
 
-    assert_receive({:got_error, error})
+    assert_receive({:got_error, ^error})
+  end
+
+  defmodule ErrorHandling do
+    def error_callback(arg, error) do
+      send(self(), {:got_arg, arg})
+      send(self(), {:got_error, error})
+    end
+  end
+
+  test_stream_and_buffer "calls error callback if supplied as MFA tuple" do
+    %{opts: opts} = test_reuse_opts
+    error = {:error, :some_reason}
+
+    ReverseProxyPlug.HTTPClientMock
+    |> expect(:request, fn _request ->
+      error
+    end)
+
+    opts_with_callback =
+      Keyword.merge(opts, error_callback: {ErrorHandling, :error_callback, [123]})
+
+    conn(:get, "/") |> ReverseProxyPlug.call(ReverseProxyPlug.init(opts_with_callback))
+
+    assert_receive({:got_arg, 123})
+    assert_receive({:got_error, ^error})
   end
 
   test_stream_and_buffer "handles request path and query string" do
@@ -238,6 +293,42 @@ defmodule ReverseProxyPlugTest do
 
     assert_receive {:url, url}
     assert url == "http://example.com:80/root_path/"
+  end
+
+  test_stream_and_buffer "don't add a redundant slash at the end of request path" do
+    %{opts: opts, get_responder: get_responder} = test_reuse_opts
+    opts_with_upstream = Keyword.merge(opts, upstream: "//example.com")
+
+    ReverseProxyPlug.HTTPClientMock
+    |> expect(:request, fn %{url: url} = request ->
+      send(self(), {:url, url})
+      get_responder.(%{}).(request)
+    end)
+
+    conn(:get, "/")
+    |> ReverseProxyPlug.call(ReverseProxyPlug.init(opts_with_upstream))
+
+    assert_receive {:url, url}
+    assert url == "http://example.com:80/"
+  end
+
+  test_stream_and_buffer "allow upstream configured at runtime" do
+    %{opts: opts, get_responder: get_responder} = test_reuse_opts
+
+    opts_with_upstream =
+      Keyword.merge(opts, upstream: fn -> "//runtime.com/root_upstream?query=yes" end)
+
+    ReverseProxyPlug.HTTPClientMock
+    |> expect(:request, fn %HTTPoison.Request{url: url} = request ->
+      send(self(), {:url, url})
+      get_responder.(%{}).(request)
+    end)
+
+    conn(:get, "/root_path")
+    |> ReverseProxyPlug.call(ReverseProxyPlug.init(opts_with_upstream))
+
+    assert_receive {:url, url}
+    assert url == "http://runtime.com:80/root_upstream/root_path?query=yes"
   end
 
   test_stream_and_buffer "include the port in the host header when is not the default and preserve_host_header is false in opts" do
@@ -336,6 +427,19 @@ defmodule ReverseProxyPlugTest do
     assert_receive {:httpclient_options, httpclient_options}
     assert timeout_val == httpclient_options[:timeout]
     assert timeout_val == httpclient_options[:recv_timeout]
+  end
+
+  test "can be initialised as a plug with an MFA error callback" do
+    defmodule Test do
+      use Plug.Builder
+
+      def error_handler(_), do: nil
+
+      plug(ReverseProxyPlug,
+        upstream: "",
+        error_callback: {__MODULE__, :error_handler, []}
+      )
+    end
   end
 
   defp simulate_upstream_error(conn, reason, opts) do

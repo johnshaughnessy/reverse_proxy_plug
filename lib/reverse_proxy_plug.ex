@@ -7,30 +7,87 @@ defmodule ReverseProxyPlug do
 
   @behaviour Plug
   @http_client HTTPoison
+  @http_methods ["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"]
 
   @spec init(Keyword.t()) :: Keyword.t()
   def init(opts) do
+    (@http_methods ++ Keyword.get(opts, :custom_http_methods, []))
+    |> Enum.each(fn x ->
+      x
+      |> String.downcase()
+      |> String.to_atom()
+    end)
+
     upstream_parts =
       opts
-      |> Keyword.get(:upstream, "")
-      |> URI.parse()
-      |> Map.to_list()
-      |> Enum.filter(fn {_, val} -> val end)
-      |> keyword_rename(:path, :request_path)
-      |> keyword_rename(:query, :query_string)
+      |> Keyword.fetch!(:upstream)
+      |> get_string()
+      |> upstream_parts()
+
+    if opts[:status_callbacks] != nil and opts[:response_mode] not in [nil, :stream] do
+      raise ":status_callbacks must only be specified with response_mode: :stream"
+    end
 
     opts
     |> Keyword.merge(upstream_parts)
     |> Keyword.put_new(:client, @http_client)
     |> Keyword.put_new(:client_options, [])
     |> Keyword.put_new(:response_mode, :stream)
+    |> Keyword.put_new(:status_callbacks, %{})
+    |> Keyword.update(:error_callback, nil, fn
+      {m, f, a} -> {m, f, a}
+      fun when is_function(fun) -> fun
+    end)
     |> Keyword.put_new(:allowed_origins, ["*"])
   end
 
   @spec call(Plug.Conn.t(), Keyword.t()) :: Plug.Conn.t()
   def call(conn, opts) do
+    upstream_parts =
+      opts
+      |> Keyword.get(:upstream, "")
+      |> get_applied_fn()
+      |> upstream_parts()
+
+    opts =
+      opts
+      |> Keyword.merge(upstream_parts)
+
     body = read_body(conn)
     conn |> request(body, opts) |> response(conn, opts)
+  end
+
+  defp get_string(upstream, default \\ "")
+
+  defp get_string(upstream, _) when is_binary(upstream) do
+    upstream
+  end
+
+  defp get_string(_, default) do
+    default
+  end
+
+  defp get_applied_fn(upstream, default \\ "")
+
+  defp get_applied_fn(upstream, _) when is_function(upstream) do
+    upstream.()
+  end
+
+  defp get_applied_fn(_, default) do
+    default
+  end
+
+  defp upstream_parts("" = _upstream) do
+    []
+  end
+
+  defp upstream_parts(upstream) do
+    upstream
+    |> URI.parse()
+    |> Map.to_list()
+    |> Enum.filter(fn {_, val} -> val end)
+    |> keyword_rename(:path, :request_path)
+    |> keyword_rename(:query, :query_string)
   end
 
   def request(conn, body, opts) do
@@ -46,14 +103,16 @@ defmodule ReverseProxyPlug do
   end
 
   def response({:ok, resp}, conn, opts) do
-    process_response(opts[:response_mode], conn, resp, opts[:allowed_origins], opts[:proxy_url], opts[:upstream])
+    process_response(opts[:response_mode], conn, resp, opts)
   end
 
   def response(error, conn, opts) do
     error_callback = opts[:error_callback]
 
-    if error_callback do
-      error_callback.(error)
+    case error_callback do
+      {m, f, a} -> apply(m, f, a ++ [error])
+      fun when is_function(fun) -> fun.(error)
+      nil -> :ok
     end
 
     conn
@@ -76,16 +135,14 @@ defmodule ReverseProxyPlug do
       |> Keyword.put(new_key, keywords[old_key])
       |> Keyword.delete(old_key)
 
-  defp process_response(:stream, conn, _resp, allowed_origins, proxy_url, upstream_url),
-    do: stream_response(conn, allowed_origins, proxy_url, upstream_url)
+  defp process_response(:stream, conn, _resp, opts),
+    do: stream_response(conn, opts)
 
   defp process_response(
          :buffer,
          conn,
          %{status_code: status, body: body, headers: headers},
-         _allowed_origins,
-         _proxy_url,
-         _upstream_url
+         _opts
        ) do
     # TODO add CORS support for non-streaming
     resp_headers =
@@ -97,12 +154,23 @@ defmodule ReverseProxyPlug do
     |> Conn.resp(status, body)
   end
 
-  defp stream_response(conn, allowed_origins, proxy_url, upstream_url) do
+  @spec stream_response(Conn.t(), Keyword.t()) :: Conn.t()
+  defp stream_response(
+         conn,
+         %{upstream_url: upstream_url, proxy_url: proxy_url, allowed_origins: allowed_origins} =
+           opts
+       ) do
     receive do
       %HTTPoison.AsyncStatus{code: code} ->
-        conn
-        |> Conn.put_status(code)
-        |> stream_response(allowed_origins, proxy_url, upstream_url)
+        case opts[:status_callbacks][code] do
+          nil ->
+            conn
+            |> Conn.put_status(code)
+            |> stream_response(opts)
+
+          handler ->
+            handler.(conn, opts)
+        end
 
       %HTTPoison.AsyncHeaders{headers: headers} ->
         conn =
@@ -156,12 +224,12 @@ defmodule ReverseProxyPlug do
 
         conn
         |> Conn.send_chunked(conn.status)
-        |> stream_response(allowed_origins, proxy_url, upstream_url)
+        |> stream_response(opts)
 
       %HTTPoison.AsyncChunk{chunk: chunk} ->
         case Conn.chunk(conn, chunk) do
           {:ok, conn} ->
-            stream_response(conn, allowed_origins, proxy_url, upstream_url)
+            stream_response(conn, opts)
 
           {:error, :closed} ->
             conn
@@ -185,7 +253,7 @@ defmodule ReverseProxyPlug do
     request_path = Path.join(overrides[:request_path] || "/", request_path)
 
     request_path =
-      if String.ends_with?(conn.request_path, "/"),
+      if String.ends_with?(conn.request_path, "/") && !String.ends_with?(request_path, "/"),
         do: request_path <> "/",
         else: request_path
 
@@ -198,7 +266,18 @@ defmodule ReverseProxyPlug do
   end
 
   defp prepare_request(conn, options) do
-    method = conn.method |> String.downcase() |> String.to_atom()
+    method =
+      try do
+        conn.method
+        |> String.downcase()
+        |> String.to_existing_atom()
+      rescue
+        ArgumentError ->
+          reraise "invalid http method, if you want to forward custom http methods, " <>
+                    "please add them as a list param of opts[:custom_http_methods].",
+                  __STACKTRACE__
+      end
+
     url = prepare_url(conn, options)
 
     headers =

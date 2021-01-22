@@ -4,12 +4,13 @@ defmodule ReverseProxyPlug.MixProject do
   def project do
     [
       app: :reverse_proxy_plug,
-      version: "1.2.1",
+      version: "1.3.2",
       elixir: "~> 1.7",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: elixirc_paths(Mix.env()),
       description: description(),
+      aliases: aliases(),
       package: package()
     ]
   end
@@ -23,10 +24,20 @@ defmodule ReverseProxyPlug.MixProject do
 
   defp package do
     %{
-      maintainers: ["Michał Szewczak"],
+      maintainers: ["Michał Szewczak", "Sam Nipps", "Matt Whitworth"],
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/tallarium/reverse_proxy_plug"}
     }
+  end
+
+  defp aliases do
+    [
+      ci: [
+        "format --check-formatted",
+        "credo --strict",
+        "compile --warnings-as-errors --force"
+      ]
+    ]
   end
 
   defp elixirc_paths(:test), do: ["test/support", "lib"]
@@ -46,7 +57,7 @@ defmodule ReverseProxyPlug.MixProject do
       {:cowboy, "~> 2.4"},
       {:httpoison, "~> 1.2"},
       {:credo, "~> 1.0", only: [:dev, :test]},
-      {:mox, "~> 0.4", only: :test},
+      {:mox, "~> 1.0", only: :test},
       {:ex_doc, "~> 0.19", only: :dev}
     ]
   end
